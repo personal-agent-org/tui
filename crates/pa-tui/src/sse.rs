@@ -7,12 +7,15 @@
 
 use std::sync::Arc;
 
-use futures_util::StreamExt;
+use futures_util::{Stream, StreamExt};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::agui;
 use crate::api::ApiClient;
 use crate::app::AppMsg;
+
+#[path = "sse/decoder.rs"]
+mod decoder;
 
 /// A decoded streaming event, ready for the app state to fold into the live message.
 #[derive(Debug)]
@@ -42,14 +45,16 @@ pub enum StreamMsg {
     /// replay (Last-Event-ID 0) rebuilds it cleanly instead of duplicating the text so far.
     Reset,
     Finished,
+    /// Transport failed without a terminal event. The canonical Run outcome is unknown.
+    Disconnected(String),
     Error(String),
 }
 
 /// Why `consume` stopped tailing a stream.
 enum Outcome {
-    /// A terminal event (or clean EOF) was seen — the turn is complete.
+    /// An explicit AG-UI terminal event was applied.
     Done,
-    /// The byte stream errored (connection dropped) — the caller may re-attach.
+    /// EOF, malformed/oversized data, or transport loss requires replay, never success.
     Transient,
 }
 
@@ -83,7 +88,7 @@ pub async fn stream_run(
     let resp = match opened {
         Ok(r) => r,
         Err(e) => {
-            let _ = tx.send(AppMsg::Stream(StreamMsg::Error(format!("{e:#}"))));
+            let _ = tx.send(AppMsg::Stream(StreamMsg::Disconnected(format!("{e:#}"))));
             return;
         }
     };
@@ -115,7 +120,7 @@ pub async fn attach_run(
     let resp = match client.attach_run_stream(&chat_id, &run_id).await {
         Ok(r) => r,
         Err(e) => {
-            let _ = tx.send(AppMsg::Stream(StreamMsg::Error(format!("{e:#}"))));
+            let _ = tx.send(AppMsg::Stream(StreamMsg::Disconnected(format!("{e:#}"))));
             return;
         }
     };
@@ -135,6 +140,7 @@ async fn pump(
     let mut resp = Some(first);
     let mut attempts: u32 = 0;
     loop {
+        let replay = resp.is_none();
         // Obtain the next response: the initial one, or a fresh re-attach.
         let r = match resp.take() {
             Some(r) => r,
@@ -147,9 +153,9 @@ async fn pump(
                     Err(_) => {
                         attempts += 1;
                         if attempts > MAX_RECONNECTS {
-                            let _ = tx.send(AppMsg::Stream(StreamMsg::Error(crate::i18n::t(
-                                crate::i18n::Msg::StreamReconnectFailed,
-                            ))));
+                            let _ = tx.send(AppMsg::Stream(StreamMsg::Disconnected(
+                                crate::i18n::t(crate::i18n::Msg::StreamReconnectFailed),
+                            )));
                             return;
                         }
                         tokio::time::sleep(backoff(attempts)).await;
@@ -159,25 +165,23 @@ async fn pump(
             }
         };
 
-        match consume(r, tx).await {
+        match consume(r, tx, replay).await {
             Outcome::Done => return,
             Outcome::Transient => {
                 // No run id → can't replay; surface the loss.
                 if run_id.is_none() {
-                    let _ = tx.send(AppMsg::Stream(StreamMsg::Error(crate::i18n::t(
+                    let _ = tx.send(AppMsg::Stream(StreamMsg::Disconnected(crate::i18n::t(
                         crate::i18n::Msg::StreamLost,
                     ))));
                     return;
                 }
                 attempts += 1;
                 if attempts > MAX_RECONNECTS {
-                    let _ = tx.send(AppMsg::Stream(StreamMsg::Error(crate::i18n::t(
+                    let _ = tx.send(AppMsg::Stream(StreamMsg::Disconnected(crate::i18n::t(
                         crate::i18n::Msg::StreamReconnectFailed,
                     ))));
                     return;
                 }
-                // Clear the live turn; the replay rebuilds it (resp stays None → re-attach).
-                let _ = tx.send(AppMsg::Stream(StreamMsg::Reset));
                 tokio::time::sleep(backoff(attempts)).await;
             }
         }
@@ -185,97 +189,118 @@ async fn pump(
 }
 
 /// Tail an SSE response, decode each `data:` frame, and relay it as a `StreamMsg`.
-/// Returns `Transient` if the byte stream errors mid-run (caller may re-attach), or `Done`
-/// on a terminal event / clean EOF.
-async fn consume(resp: reqwest::Response, tx: &UnboundedSender<AppMsg>) -> Outcome {
-    let mut stream = resp.bytes_stream();
-    let mut buf: Vec<u8> = Vec::new();
-    let mut data = String::new();
+/// HTTP success and clean EOF are not a canonical terminal event.
+async fn consume(resp: reqwest::Response, tx: &UnboundedSender<AppMsg>, replay: bool) -> Outcome {
+    let is_sse = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("text/event-stream"));
+    if !is_sse {
+        return Outcome::Transient;
+    }
+    consume_chunks(resp.bytes_stream(), tx, replay).await
+}
 
+async fn consume_chunks<S, B, E>(
+    stream: S,
+    tx: &UnboundedSender<AppMsg>,
+    mut replay: bool,
+) -> Outcome
+where
+    S: Stream<Item = Result<B, E>>,
+    B: AsRef<[u8]>,
+{
+    futures_util::pin_mut!(stream);
+    let mut decoder = decoder::Decoder::default();
     while let Some(chunk) = stream.next().await {
         let chunk = match chunk {
             Ok(c) => c,
-            // Connection dropped mid-stream (proxy idle close, HTTP/2 reset, …). Don't fail
-            // the turn — let the caller re-attach and replay.
             Err(_) => return Outcome::Transient,
         };
-        buf.extend_from_slice(&chunk);
-
-        // Process whole lines; bytes after the last '\n' stay buffered for the next chunk.
-        while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
-            let line_bytes: Vec<u8> = buf.drain(..=pos).collect();
-            let line = String::from_utf8_lossy(&line_bytes);
-            let line = line.trim_end_matches(['\n', '\r']);
-
-            if line.is_empty() {
-                // Blank line = event boundary; dispatch the accumulated data payload.
-                if !data.is_empty() {
-                    if dispatch(&data, tx) {
-                        return Outcome::Done; // terminal event seen
-                    }
-                    data.clear();
-                }
-            } else if let Some(rest) = line.strip_prefix("data:") {
-                let rest = rest.strip_prefix(' ').unwrap_or(rest);
-                if !data.is_empty() {
-                    data.push('\n');
-                }
-                data.push_str(rest);
+        for &byte in chunk.as_ref() {
+            match decoder.push(byte) {
+                Ok(Some(data)) => match dispatch(&data, tx, &mut replay) {
+                    Ok(true) => return Outcome::Done,
+                    Ok(false) => {}
+                    Err(()) => return Outcome::Transient,
+                },
+                Ok(None) => {}
+                Err(_) => return Outcome::Transient,
             }
-            // `id:`/`retry:`/`: comment` (heartbeats) lines are ignored.
         }
     }
-
-    // Stream closed without an explicit terminal event — treat as done.
-    let _ = tx.send(AppMsg::Stream(StreamMsg::Finished));
-    Outcome::Done
+    Outcome::Transient
 }
 
 /// Map one BusRecord's AG-UI event to a StreamMsg. Returns true on a terminal event.
-fn dispatch(data: &str, tx: &UnboundedSender<AppMsg>) -> bool {
+fn dispatch(data: &str, tx: &UnboundedSender<AppMsg>, replay: &mut bool) -> Result<bool, ()> {
     let Some(record) = agui::parse_bus_record(data) else {
-        return false;
+        return Err(());
     };
     let ev = record.ev;
+    let terminal = matches!(ev.kind.as_str(), agui::RUN_FINISHED | agui::RUN_ERROR);
+    // Build the entire presentation message before touching the UI, including Reset.
+    // Missing rendered fields are not empty deltas/default tool results: skipping such
+    // an event and accepting a later terminal would conceal an incomplete replay.
     let msg = match ev.kind.as_str() {
-        agui::TEXT_MESSAGE_CONTENT => ev.delta.map(StreamMsg::Text),
-        agui::THINKING_CONTENT => ev.delta.map(StreamMsg::Thinking),
+        agui::TEXT_MESSAGE_CONTENT => Some(StreamMsg::Text(ev.delta.ok_or(())?)),
+        agui::THINKING_CONTENT => Some(StreamMsg::Thinking(ev.delta.ok_or(())?)),
         agui::TOOL_CALL_START => Some(StreamMsg::ToolStart {
-            id: ev.tool_call_id.unwrap_or_default(),
-            name: ev.tool_call_name.unwrap_or_else(|| "tool".into()),
+            id: ev.tool_call_id.ok_or(())?,
+            name: ev.tool_call_name.ok_or(())?,
         }),
-        agui::TOOL_CALL_ARGS => ev.delta.map(|delta| StreamMsg::ToolArgs {
-            id: ev.tool_call_id.unwrap_or_default(),
-            delta,
+        agui::TOOL_CALL_ARGS => Some(StreamMsg::ToolArgs {
+            id: ev.tool_call_id.ok_or(())?,
+            delta: ev.delta.ok_or(())?,
         }),
         agui::TOOL_CALL_RESULT => Some(StreamMsg::ToolResult {
-            id: ev.tool_call_id.unwrap_or_default(),
-            content: ev.content.unwrap_or_default(),
+            id: ev.tool_call_id.ok_or(())?,
+            content: ev.content.ok_or(())?,
         }),
-        agui::RUN_FINISHED => {
-            let _ = tx.send(AppMsg::Stream(StreamMsg::Finished));
-            return true;
-        }
-        agui::RUN_ERROR => {
-            let m = ev.message.unwrap_or_else(|| "Run fehlgeschlagen".into());
-            let _ = tx.send(AppMsg::Stream(StreamMsg::Error(m)));
-            return true;
-        }
+        agui::RUN_FINISHED => Some(StreamMsg::Finished),
+        agui::RUN_ERROR => Some(StreamMsg::Error(ev.message.ok_or(())?)),
         agui::CUSTOM if ev.name.as_deref() == Some(agui::CUSTOM_USAGE) => {
-            ev.value.map(|v| StreamMsg::Usage {
-                model: v
-                    .get("model_name")
-                    .and_then(|x| x.as_str())
-                    .map(String::from),
-                input: v.get("input_tokens").and_then(|x| x.as_i64()).unwrap_or(0),
-                output: v.get("output_tokens").and_then(|x| x.as_i64()).unwrap_or(0),
-                cost: v.get("cost_usd").and_then(|x| x.as_f64()),
+            let v = ev.value.ok_or(())?;
+            // UsagePayload requires model_name; token counts default to zero and cost
+            // may be absent/null. Wrong-typed present fields are never guessed away.
+            let count = |key| {
+                v.get(key)
+                    .map(|value| value.as_i64().ok_or(()))
+                    .transpose()
+                    .map(|count| count.unwrap_or(0))
+            };
+            Some(StreamMsg::Usage {
+                model: Some(
+                    v.get("model_name")
+                        .and_then(|value| value.as_str())
+                        .ok_or(())?
+                        .into(),
+                ),
+                input: count("input_tokens")?,
+                output: count("output_tokens")?,
+                cost: v
+                    .get("cost_usd")
+                    .filter(|value| !value.is_null())
+                    .map(|value| value.as_f64().ok_or(()))
+                    .transpose()?,
             })
         }
         _ => None,
     };
+    // A successful handshake, heartbeat, malformed frame or empty replay proves no
+    // replacement content. Reset exactly once, after validating the complete first
+    // replay record and before applying it. Unrendered AG-UI kinds remain extensible.
+    if std::mem::replace(replay, false) {
+        let _ = tx.send(AppMsg::Stream(StreamMsg::Reset));
+    }
     if let Some(msg) = msg {
         let _ = tx.send(AppMsg::Stream(msg));
     }
-    false
+    Ok(terminal)
 }
+
+#[cfg(test)]
+#[path = "sse/tests.rs"]
+mod tests;

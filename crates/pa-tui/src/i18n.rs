@@ -17,6 +17,14 @@ pub enum Lang {
 // (env/system at startup, then refined by the loaded config's `lang`).
 static LANG: AtomicU8 = AtomicU8::new(0);
 
+/// The display language is a process-global (`static LANG`). Tests in this crate that either
+/// **mutate** or **depend on** it must serialize on this one lock: two `i18n` tests set the
+/// language, and the `ui::render_snapshots` tests render the role label, which is localized.
+/// Without a shared lock the snapshots would depend on whether an `i18n` test happened to leave
+/// `en` behind -- a test whose result is decided by the harness's ordering is not a test.
+#[cfg(test)]
+pub(crate) static LANG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub fn init_from(explicit: Option<&str>) {
     let lang = explicit
         .and_then(parse)
@@ -251,6 +259,7 @@ pub enum Msg<'a> {
     ApiRefreshFailed,
     LoginSuccess(&'a str),
     LoginStartHint,
+    RustBackendNoChatUi,
     LogoutDone(&'a str),
     LogoutNone,
     // Computer Service installer (launched from the TUI after restoring the terminal)
@@ -303,10 +312,13 @@ pub fn t(m: Msg) -> String {
             "Connection lost – reconnecting …",
         ),
         Msg::StreamReconnectFailed => pick(
-            "Reconnect fehlgeschlagen – Run läuft serverseitig weiter (Chat neu öffnen)",
-            "Reconnect failed – the run continues server-side (reopen the chat)",
+            "Reconnect fehlgeschlagen – Run-Status unbekannt (Chat neu öffnen)",
+            "Reconnect failed – run status unknown (reopen the chat)",
         ),
-        Msg::StreamLost => pick("Verbindung zum Stream verloren", "Lost the stream connection"),
+        Msg::StreamLost => pick(
+            "Verbindung zum Stream verloren – Run-Status unbekannt",
+            "Lost the stream connection – run status unknown",
+        ),
         Msg::CancelSent => pick("Abbruch gesendet …", "Cancel sent …"),
         Msg::RunCancelled => pick("Run abgebrochen", "Run cancelled"),
         Msg::Done => pick("Fertig", "Done"),
@@ -745,14 +757,18 @@ pub fn t(m: Msg) -> String {
         ),
         Msg::LoginSuccess(path) => {
             if en() {
-                format!("\nSigned in ✓ config: {path}")
+                format!("\nSigned in ✓ session stored at {path}")
             } else {
-                format!("\nAngemeldet ✓ Konfiguration: {path}")
+                format!("\nAngemeldet ✓ Sitzung gespeichert unter {path}")
             }
         }
         Msg::LoginStartHint => pick(
-            "Start the UI with: pa",
-            "Start the UI with: pa",
+            "Unterhaltungen anzeigen mit: pa conversations",
+            "List your conversations with: pa conversations",
+        ),
+        Msg::RustBackendNoChatUi => pick(
+            "Die Chat-Oberfläche spricht noch nicht mit diesem Server; hier sind die Unterhaltungen.",
+            "The chat UI does not speak to this server yet; here are its conversations.",
         ),
         Msg::LogoutDone(path) => {
             if en() {
@@ -1184,11 +1200,6 @@ fn op_label(op: Op) -> &'static str {
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    // The display language is a process-global (`static LANG`); serialize the tests that
-    // mutate it so they don't race when the harness runs tests in parallel.
-    static LANG_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn switches_language_and_formats_args() {

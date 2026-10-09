@@ -1,37 +1,11 @@
-//! Device-flow login for the TUI: the shared `pa_oidc` device grant (RFC 8628) plus this
-//! surface's localized prompts. The TUI prints a URL + code, the user authorizes in a browser,
-//! and we poll for tokens. The access token is then sent as `Authorization: Bearer` on every
-//! REST/SSE call (and as the `bearer,<jwt>` subprotocol on the control WS).
-//!
-//! Works with external OIDC and with the backend's local identity provider:
-//! the endpoints come from the server's client-config, not from the issuer's URL shape.
+//! The legacy chat UI's OAuth refresh. Its tokens come from a legacy `config.toml`; new
+//! sign-ins go through the Rust backend's device authorization (`rust_conversation::device`)
+//! and never produce such tokens.
 
 use anyhow::Result;
-use pa_oidc::{Endpoints, Prompt, Tokens};
+use pa_oidc::Tokens;
 
-use crate::i18n::{t, Msg};
-
-struct TuiPrompt;
-
-impl Prompt for TuiPrompt {
-    fn authorize(&self, url: &str, user_code: &str) {
-        eprintln!("{}", t(Msg::OidcOpen));
-        eprintln!("    {url}");
-        eprintln!("{}", t(Msg::OidcCode(user_code)));
-        eprintln!("{}", t(Msg::OidcWaiting));
-    }
-
-    fn failed(&self, error: &str) -> String {
-        t(Msg::OidcFailed(error))
-    }
-}
-
-/// Run the full device-code login flow; blocks until the user authorizes (or it errors).
-pub async fn device_login(endpoints: &Endpoints, client_id: &str) -> Result<Tokens> {
-    pa_oidc::device_login(endpoints, client_id, &TuiPrompt).await
-}
-
-/// Exchange a refresh token at the endpoint discovered and persisted during login.
+/// Exchange a refresh token at the endpoint persisted in the legacy config.
 pub async fn refresh(token_endpoint: &str, client_id: &str, refresh_token: &str) -> Result<Tokens> {
     pa_oidc::refresh(token_endpoint, client_id, refresh_token).await
 }

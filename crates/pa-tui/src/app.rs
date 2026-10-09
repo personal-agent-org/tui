@@ -1876,6 +1876,16 @@ impl App {
         let Some(idx) = self.pending_idx else {
             return;
         };
+        if let StreamMsg::Disconnected(reason) = s {
+            // A transport loss proves no terminal state. Preserve partial output and
+            // the Run id (for explicit cancel/reopen); do not synthesize a Run error
+            // or run the terminal-success refresh path.
+            self.messages[idx].pending = false;
+            self.pending_idx = None;
+            self.streaming = false;
+            self.status = reason;
+            return;
+        }
         let done = matches!(s, StreamMsg::Finished | StreamMsg::Error(_));
         match s {
             StreamMsg::RunId(rid) => self.active_run_id = Some(rid),
@@ -1923,6 +1933,7 @@ impl App {
                 });
             }
             StreamMsg::Finished => self.status = t(Msg::Done),
+            StreamMsg::Disconnected(_) => unreachable!("handled without a terminal transition"),
             StreamMsg::Error(e) => {
                 let m = &mut self.messages[idx];
                 if !m.text.is_empty() {
@@ -3494,6 +3505,29 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stream_disconnect_preserves_partial_content_and_run_identity_without_completion() {
+        let client = Arc::new(ApiClient::new(&crate::config::Config::default()).unwrap());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(client, tx);
+        let mut message = UiMessage::assistant_pending();
+        message.text = "partial output".into();
+        app.messages.push(message);
+        app.pending_idx = Some(0);
+        app.streaming = true;
+        app.active_run_id = Some("r".into());
+
+        app.handle_stream(StreamMsg::Disconnected("run status unknown".into()));
+
+        assert_eq!(app.messages[0].text, "partial output");
+        assert!(!app.messages[0].pending);
+        assert_eq!(app.active_run_id.as_deref(), Some("r"));
+        assert!(!app.streaming);
+        assert!(app.pending_idx.is_none());
+        assert_eq!(app.status, "run status unknown");
+        assert!(rx.try_recv().is_err(), "no terminal follow-up requests");
+    }
 
     #[test]
     fn filter_label_maps_index_to_status_key() {

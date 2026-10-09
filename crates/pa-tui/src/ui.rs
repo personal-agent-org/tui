@@ -2181,6 +2181,18 @@ mod render_snapshots {
         }
     }
 
+    /// The role label is localized, and the display language is a process-global that an
+    /// `i18n` test may have left on `en`. These snapshots were taken in **English**, so pin it:
+    /// a snapshot whose result depends on the harness's ordering is not a snapshot.
+    /// The guard is returned so the caller keeps the lock for the whole render.
+    fn pinned_english() -> std::sync::MutexGuard<'static, ()> {
+        let guard = crate::i18n::LANG_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::i18n::init_from(Some("en"));
+        guard
+    }
+
     fn msg(role: &str, text: &str) -> UiMessage {
         UiMessage {
             id: String::new(),
@@ -2197,6 +2209,7 @@ mod render_snapshots {
 
     #[test]
     fn user_message() {
+        let _lang = pinned_english();
         let mut out = Vec::new();
         render_message(&mut out, &msg("user", "Wie geht es dem Deployment?"), 60, 0);
         insta::assert_snapshot!(plain(&out));
@@ -2215,6 +2228,7 @@ mod render_snapshots {
 
     #[test]
     fn long_words_break_rather_than_overflow() {
+        let _lang = pinned_english();
         let mut out = Vec::new();
         render_message(&mut out, &msg("user", &"a".repeat(90)), 40, 0);
         insta::assert_snapshot!(plain(&out));

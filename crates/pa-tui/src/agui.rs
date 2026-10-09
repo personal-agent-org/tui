@@ -51,18 +51,28 @@ pub struct AgUiEvent {
 
 /// The versioned wire record. The client de-dupes on `(run_id, seq)` since publishes
 /// are at-least-once.
-#[allow(dead_code)] // run_id/seq decoded for completeness; dedup is a later slice
 #[derive(Deserialize, Debug)]
 pub struct BusRecord {
-    #[serde(default)]
+    /// Matches the producer's BUS_PROTOCOL_VERSION default. Unknown revisions are
+    /// not silently interpreted as this version's completion/error contract.
+    #[serde(default = "bus_protocol_version")]
+    pub v: u8,
     pub run_id: String,
-    #[serde(default)]
     pub seq: i64,
     pub ev: AgUiEvent,
 }
 
+fn bus_protocol_version() -> u8 {
+    1
+}
+
 pub fn parse_bus_record(data: &str) -> Option<BusRecord> {
-    serde_json::from_str(data).ok()
+    let record: BusRecord = serde_json::from_str(data).ok()?;
+    (record.v == bus_protocol_version()
+        && !record.run_id.is_empty()
+        && record.seq >= 0
+        && !record.ev.kind.is_empty())
+    .then_some(record)
 }
 
 #[cfg(test)]
@@ -96,5 +106,31 @@ mod tests {
         assert_eq!(rec.ev.name.as_deref(), Some(CUSTOM_USAGE));
         let v = rec.ev.value.unwrap();
         assert_eq!(v["input_tokens"].as_i64(), Some(10));
+    }
+
+    #[test]
+    fn missing_identity_and_unsupported_versions_are_not_terminal_events() {
+        for data in [
+            r#"{"ev":{"type":"RUN_FINISHED"}}"#,
+            r#"{"run_id":"r","ev":{"type":"RUN_FINISHED"}}"#,
+            r#"{"seq":1,"ev":{"type":"RUN_FINISHED"}}"#,
+            r#"{"v":2,"run_id":"r","seq":1,"ev":{"type":"RUN_FINISHED"}}"#,
+            r#"{"v":0,"run_id":"r","seq":1,"ev":{"type":"RUN_FINISHED"}}"#,
+            r#"{"v":1,"run_id":"","seq":1,"ev":{"type":"RUN_FINISHED"}}"#,
+            r#"{"v":1,"run_id":"r","seq":-1,"ev":{"type":"RUN_FINISHED"}}"#,
+            r#"{"v":1,"run_id":"r","seq":1,"ev":{"type":""}}"#,
+        ] {
+            assert!(parse_bus_record(data).is_none(), "accepted {data}");
+        }
+    }
+
+    #[test]
+    fn producer_default_version_and_zero_sequence_control_event_remain_supported() {
+        let record = parse_bus_record(
+            r#"{"run_id":"r","seq":0,"ev":{"type":"CUSTOM","name":"personal_agent.reconnect","value":{"run_id":"r","reason":"max_lifetime"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(record.v, 1);
+        assert_eq!(record.seq, 0);
     }
 }

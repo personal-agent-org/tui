@@ -3,7 +3,7 @@ name = "pa-oidc"
 version.workspace = true
 license.workspace = true
 edition.workspace = true
-description = "Personal Agent device-authorization-grant client - one code path for Keycloak (oidc) and the backend's local identity provider"
+description = "Personal Agent client TLS trust (system roots + SSL_CERT_FILE) and the legacy OAuth refresh grant"
 
 [lib]
 name = "pa_oidc"
@@ -19,6 +19,8 @@ rustls = { version = "0.23", features = ["ring"] }
 rustls-native-certs = "0.8"
 # Fallback only, for machines with no system store at all (scratch containers).
 webpki-roots = "0.26"
+# The same verifier rustls uses; only for the name check of an explicitly pinned certificate.
+webpki = { package = "rustls-webpki", version = "0.103", default-features = false, features = ["std"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["time"] }

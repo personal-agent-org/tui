@@ -1490,6 +1490,7 @@ dependencies = [
  "reqwest",
  "rustls",
  "rustls-native-certs",
+ "rustls-webpki",
  "serde",
  "serde_json",
  "tokio",
@@ -1510,12 +1511,16 @@ dependencies = [
  "pa-oidc",
  "ratatui",
  "reqwest",
+ "ring",
+ "rustix 1.1.4",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "tokio-tungstenite",
  "toml",
  "tui-markdown",
+ "zeroize",
 ]
 
 [[package]]

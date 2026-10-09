@@ -11,7 +11,7 @@ path = "src/lib.rs"
 
 [dependencies]
 pa-oidc = { path = "../pa-oidc" }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "io-util", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "io-util", "signal", "net"] }
 # TLS trust comes from pa-oidc::tls (system store + SSL_CERT_FILE, webpki only as a fallback),
 # handed to reqwest as a preconfigured config -- so an internal CA works here too.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots-no-provider", "json", "stream"] }
@@ -21,10 +21,17 @@ tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# The published endpoint-trust document is content-addressed; the client recomputes
+# that address over the exact bytes it was served rather than trusting the header.
+sha2 = "0.10"
+# Ed25519 verification of the discovery signature against the published key, and the
+# randomness of each refresh's Idempotency-Key. Already linked through rustls.
+ring = "0.17"
 toml = "0.8"
 clap = { version = "4", features = ["derive"] }
 dirs = "5"
 anyhow = "1"
+zeroize = "1"
 base64 = "0.22"
 # scrolling-regions: `insert_before` then uses DECSTBM scroll regions and does not have to
 # redraw the viewport at all — which is what makes writing the transcript into the terminal's
@@ -34,6 +41,9 @@ crossterm = { version = "0.28", features = ["event-stream"] }
 # Markdown → styled ratatui Text (assistant/user message bodies). No longer pinned: the exact
 # pin existed to hold ratatui at 0.29, and it was holding the whole crate back with it.
 tui-markdown = "0.3"
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["fs", "process"] }
 
 [dev-dependencies]
 # Snapshot tests for the render helpers: a rendering change shows up as a reviewable diff

@@ -1,1 +1,5 @@
 target
+
+# Python bytecode of the tools (generate_rust_conversation*.py, test_*.py).
+__pycache__/
+*.pyc
