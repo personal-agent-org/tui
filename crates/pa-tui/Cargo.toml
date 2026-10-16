@@ -29,7 +29,7 @@ sha2 = "0.10"
 ring = "0.17"
 toml = "0.8"
 clap = { version = "4", features = ["derive"] }
-dirs = "5"
+dirs = "7"
 anyhow = "1"
 zeroize = "1"
 base64 = "0.22"
